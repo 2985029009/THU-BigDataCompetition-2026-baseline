@@ -33,6 +33,41 @@ DEFAULT_SEARCH_SPACE = {
 }
 
 
+def _build_search_optimizer(model, config):
+    """Build the INFO-search optimizer with the formal training LR groups.
+
+    A gated model uses a separate, faster-learning parameter group for the
+    learned gate.  INFO candidates must use the same split so their selected
+    ``learning_rate`` is transferable to formal gated training.
+    """
+    learning_rate = config['learning_rate']
+    if not config.get('soft_gate_enabled', False):
+        return torch.optim.AdamW(
+            model.parameters(), lr=learning_rate, weight_decay=1e-5
+        )
+
+    gate_parameters = list(model.market_gate.parameters())
+    if not config.get('soft_gate_rule_mode', False):
+        gate_parameters.append(model.soft_gate_bias)
+    gate_parameter_ids = {id(parameter) for parameter in gate_parameters}
+    base_parameters = [
+        parameter for parameter in model.parameters()
+        if id(parameter) not in gate_parameter_ids
+    ]
+    return torch.optim.AdamW(
+        [
+            {'params': base_parameters, 'lr': learning_rate},
+            {
+                'params': gate_parameters,
+                'lr': learning_rate * float(
+                    config.get('soft_gate_learning_rate_multiplier', 20.0)
+                ),
+            },
+        ],
+        weight_decay=1e-5,
+    )
+
+
 def sample_config(search_space, base_config, rng=None):
     """从搜索空间中随机采样一组超参配置。
 
@@ -181,12 +216,8 @@ class INFOOptimizer:
             model = model_builder(config)
             model.to(device)
 
-            # 构建优化器
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=config['learning_rate'],
-                weight_decay=1e-5
-            )
+            # 与正式训练保持相同的主模型/门控学习率参数组。
+            optimizer = _build_search_optimizer(model, config)
             scheduler = torch.optim.lr_scheduler.LinearLR(
                 optimizer,
                 start_factor=1.0,

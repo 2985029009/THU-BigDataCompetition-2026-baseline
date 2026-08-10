@@ -91,6 +91,59 @@ def build_inference_sequences(data, features, sequence_length, stock_ids, latest
 	return np.asarray(sequences, dtype=np.float32), sequence_stock_ids
 
 
+def prepare_predict_features(processed, features, scaler):
+	"""Apply the exact feature transforms used by prediction before inference.
+
+	This function deliberately does not construct labels.  It is shared by the
+	prediction CLI and offline evaluation so that the evaluated universe is the
+	same universe that would be sent to the deployed model.
+	"""
+	processed = processed.copy()
+	base_features = config.get('base_feature_names', features)
+	if config.get('feature_transform') == 'cross_sectional_rank':
+		if 'is_member' in processed.columns:
+			processed = point_in_time_cross_sectional_rank(
+				processed, base_features
+			)
+		else:
+			processed[base_features] = (
+				processed.groupby('日期', sort=False)[base_features]
+				.rank(method='average', pct=True)
+			)
+	if config.get('feature_num') == 'baseline24_market4_cross4':
+		center = config.get('market_cross_center_raw')
+		scale = config.get('market_cross_scale_raw')
+		if center is None or scale is None:
+			raise ValueError('交叉特征模型缺少训练期市场压力统计量')
+		processed = add_market_cross_features(processed, center, scale)
+	elif config.get('feature_num') == 'baseline24_market4_component2':
+		center = config.get('market_cross_center_raw')
+		scale = config.get('market_cross_scale_raw')
+		if center is None or scale is None:
+			raise ValueError('市场分量交叉模型缺少训练期标准化统计量')
+		processed = add_market_component_cross_features(processed, center, scale)
+	processed[features] = processed[features].replace([np.inf, -np.inf], np.nan)
+	processed = processed.dropna(subset=features).copy()
+	processed[features] = scaler.transform(processed[features])
+	return processed
+
+
+def get_predict_candidate_ids(processed, prediction_date):
+	"""Return the point-in-time candidate universe used by ``predict.py``."""
+	prediction_date = pd.Timestamp(prediction_date).normalize()
+	if {'is_member', 'is_tradable'}.issubset(processed.columns):
+		candidates = processed[
+			processed['日期'].eq(prediction_date)
+			& processed['is_member'].astype(bool)
+			& processed['is_tradable'].astype(bool)
+		]['股票代码'].unique()
+	else:
+		candidates = processed[
+			processed['日期'].eq(prediction_date)
+		]['股票代码'].unique()
+	return sorted(candidates)
+
+
 def main():
 	# 使用项目根目录的 output 文件夹
 	project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -179,45 +232,11 @@ def main():
 
 	processed, all_features = preprocess_predict_data(raw_df, stockid2idx)
 	features = config.get('feature_names', all_features)
-	base_features = config.get('base_feature_names', features)
-	if config.get('feature_transform') == 'cross_sectional_rank':
-		if 'is_member' in processed.columns:
-			processed = point_in_time_cross_sectional_rank(processed, base_features)
-		else:
-			processed[base_features] = (
-				processed.groupby('日期', sort=False)[base_features]
-				.rank(method='average', pct=True)
-			)
-	if config.get('feature_num') == 'baseline24_market4_cross4':
-		center = config.get('market_cross_center_raw')
-		scale = config.get('market_cross_scale_raw')
-		if center is None or scale is None:
-			raise ValueError('交叉特征模型缺少训练期市场压力统计量')
-		processed = add_market_cross_features(processed, center, scale)
-	elif config.get('feature_num') == 'baseline24_market4_component2':
-		center = config.get('market_cross_center_raw')
-		scale = config.get('market_cross_scale_raw')
-		if center is None or scale is None:
-			raise ValueError('市场分量交叉模型缺少训练期标准化统计量')
-		processed = add_market_component_cross_features(processed, center, scale)
-	processed[features] = processed[features].replace([np.inf, -np.inf], np.nan)
-	processed = processed.dropna(subset=features).copy()
-
 	scaler = joblib.load(scaler_path)
-	processed[features] = scaler.transform(processed[features])
+	processed = prepare_predict_features(processed, features, scaler)
 
 	sequence_length = config['sequence_length']
-	if {'is_member', 'is_tradable'}.issubset(processed.columns):
-		latest_candidates = processed[
-			processed['日期'].eq(latest_date)
-			& processed['is_member'].astype(bool)
-			& processed['is_tradable'].astype(bool)
-		]['股票代码'].unique()
-	else:
-		# 赛事纯行情面板以预测日实际存在的记录隐式定义当日股票池。
-		latest_candidates = processed[
-			processed['日期'].eq(latest_date)
-		]['股票代码'].unique()
+	latest_candidates = get_predict_candidate_ids(processed, latest_date)
 	sequences_np, sequence_stock_ids = build_inference_sequences(
 		processed,
 		features,

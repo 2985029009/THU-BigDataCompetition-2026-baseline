@@ -37,5 +37,17 @@ code/src/model/
 # Logs
 *.tfevents.*
 
+# Local research artifacts and tool state
+# Keep the repository limited to the reproducible source/configuration subset.
+outputs/
+tmp/
+archive_*/
+codex_generated/
+.codeartsdoer/
+.codegraph/
+figures/
+test/result.csv
+test/results_output/
+
 # Canvas
 *.canvas.tsx
